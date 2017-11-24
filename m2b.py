@@ -11,15 +11,19 @@ from PySide.QtGui import *
 from maya.app.general.mayaMixin import MayaQWidgetDockableMixin  
 
 
+# TODO works only on selection
+# TODO write out UDIM > SG assignment
+
+
 
 
 # /// UTILS
-
 def unroll_list(list_):
     if type(list_) is not list:
         return list_
     if len(list_) > 0:
         return list_[0]
+
 
 def is_material(node):
     has_se = False
@@ -34,6 +38,74 @@ def is_material(node):
             #print node, 'is material', node.type()
             return node
     return None
+
+def transform_udim(node, udim_source, udim_target, faces):
+    pm.mel.polySplitTextureUV()
+    print 'mv u', node, udim_source+udim_target
+    pm.polyEditUV(faces, relative=True, uValue=udim_source+udim_target)
+
+
+def sg_to_udim(node):
+    udim = 0
+    mapping = {}
+    sgs = node.getShape().outputs(type='shadingEngine')
+    # strip double sgs
+    sgs = list(set(sgs))
+    for sg in sgs:
+        faces = sg.members()
+        print 'f', sg, len(faces), faces
+        #pm.select(faces)
+        mapping[udim] = sg.name()
+        transform_udim(node, 0, udim, faces)
+        udim += 1
+
+    return mapping
+
+def sg_from_string(sgnamestring):
+    if len(sgnamestring) < 1:
+        return False
+    try:
+        return pm.PyNode(sgnamestring)
+    except pm.general.MayaNodeError:
+        return False
+
+def faces_from_udim(node, udim):
+    print 'UDIM', udim, 'requested'
+    udim_faces = []
+
+    def in_range(num, dim):
+        if num >= dim and num <= num + 1:
+            return True
+        else:
+            return False 
+
+    for face in node.getShape().f:
+        uvalues = face.getUVs()[0]
+
+        if all([in_range(u, udim) for u in uvalues]):
+            udim_faces.append(face)
+        
+    # faceselection = pm.polyListComponentConversion(udim_verts, toFace=True)
+    return udim_faces
+
+
+def udim_to_sg(node, mapping):
+    print '\nUDIM to SG'
+
+    # iterate over Shading group > UDIM mapping
+    print 'MAPPING', mapping
+    for udim, sgstring in mapping.iteritems():
+        
+        faces = faces_from_udim(node, udim)
+        sg = sg_from_string(sgstring)
+        print 'DEBUG', sgstring, '>' , sg, faces, 'UDIM', udim
+        if not sg or len(faces) < 1:
+            print 'material could not be found or no faces: SG:', sgstring, sg, 'faces', faces
+        else:
+            pm.sets(sg, e = True, forceElement = faces)
+            pm.mel.polySplitTextureUV()
+            pm.polyEditUV(faces, relative=True, uValue=-udim)
+
 
 
 def guess_diffuse_file(node):
@@ -71,18 +143,23 @@ def get_blender_path(root='/Applications'):
 
 
 def replace_mesh(old, new):
-    shading_engines = old.getShape().outputs(type='shadingEngine')[0]
-
-    old_mesh = old.listRelatives(shapes=True)[0]
+    
+    # ok, this is stupid. But whatever I do, Maya spawns a polySurfaceNode.
+    # It is not parented to the original but seems to be a relative. We need
+    # to delete it first.
+    for surf in old.listRelatives():
+        print surf
+        if 'polySurfaceShape' in surf.name():
+            print 'delete', surf
+            pm.delete(surf)
+    old_mesh = old.getShape()
     old_mesh_name = old_mesh.name()
+    
     pm.delete(old_mesh)
-    print new
-    new_mesh = new.listRelatives(shapes=True)[0]
+    new_mesh = new.getShape()
     pm.rename(new_mesh, old_mesh_name)
     pm.parent(new_mesh, old, shape=True, relative=True)
     pm.delete(new)
-    
-    pm.sets(shading_engines, edit=True, forceElement=old)  
 
 
 def load_geofile(filepath):
@@ -178,7 +255,7 @@ class AppSettings(object):
             print 'could not write', self.settings    
             
     def __repr__(self):
-        return 'sssss'
+        return '{0} {1} {2}'.format(self.app, self.binary, self.settings)
         #return '{0}'.format(self.app self.binary, self.settings)
 
 
@@ -206,7 +283,7 @@ class KeepSelection(object):
         print '> restore sel'
         pm.select(self.selection)
 
-#################### GUI
+#################### GUI ####################################################
 
 class UiClass (MayaQWidgetDockableMixin, QWidget):
     def __init__(self, parent=None):
@@ -247,8 +324,13 @@ class UiClass (MayaQWidgetDockableMixin, QWidget):
                     APP_SETTINGS.save()
                 else:
                     print 'Could not get binary for', current_app_name                    
-                
+            
             init(discard=do_discard)
+            #node = pm.selected()[0]
+            #mapping = sg_to_udim(node)
+            #print mapping
+            #mapping = {0: 'phong1SG', 1: 'phong2SG'}
+            #udim_to_sg(node, mapping)
             self.close()
              
 
@@ -273,7 +355,7 @@ class UiClass (MayaQWidgetDockableMixin, QWidget):
         self.show()
 
 class BridgedNode(object):
-    def __init__(self, uuid):
+    def __init__(self, uuid=None, load=False):
         self.uuid = uuid
         self.node = None
         self.texture = None
@@ -282,9 +364,14 @@ class BridgedNode(object):
         self.matrix = None
         self.valid = False
         self.blendfile = False
-        self.updatescript = None   
-        
-        self.ingest()
+        self.updatescript = None
+        self.udims = None
+        if self.uuid is not None:
+            self.ingest()
+
+        if load:
+            self.load()
+
     
     def is_valid(self):
         print '> validating:'
@@ -310,6 +397,7 @@ class BridgedNode(object):
     
     
     def ingest(self):
+        print '\n\nINGESTING BRIDGE NODE\n\n'
         # get scene object
         for node in pm.ls(transforms=True):
             if cmds.ls(node.name(), uuid=True)[0] == self.uuid:
@@ -321,13 +409,28 @@ class BridgedNode(object):
         #print 'node', self.node
         self.texture = guess_diffuse_file(self.node)
         self.updatescript = BLENDER_SCRIPT
+        self.udims = sg_to_udim(self.node)
         
+    def load_metadata(self):
+        if os.path.isfile(self.metadatafile):
+            with open(self.metadatafile) as metadata:
+                return json.load(metadata)
+
+    def load(self):
+        meta = self.load_metadata()
+        parsed_udims = {}
+        for key, value in meta['udims'].iteritems():
+            parsed_udims[key] = float(value)
+        self.udims = parsed_udims
+
     def dump_metadata(self):
-        metadata = {'obj': self.geofile,
+        metadata = {
+            'obj': self.geofile,
             'tex': self.texture,
             'blend': self.blendfile,
             'uuid': self.uuid,
             'updatescript': self.updatescript,
+            'udims': self.udims,
             'port': PORT
             }
        
@@ -349,7 +452,8 @@ class BridgedNode(object):
 
         
     def edit_in_app(self):
-        
+        print 'edit in app'
+        print APP_SETTINGS.app
         binary = APP_SETTINGS.binary
         
         OSX_BLENDER_BIN = 'Contents/MacOS/blender'
@@ -360,13 +464,17 @@ class BridgedNode(object):
             if binary.endswith('.app'):
                 binary = os.path.join(binary, OSX_BLENDER_BIN)
         
-        blendfile = self.blendfile
-        cmd = [binary, '--python', BLENDER_SCRIPT, blendfile]
-        #print 'CMD', cmd
-        subprocess.Popen(cmd)
+            blendfile = self.blendfile
+            cmd = [binary, '--python', BLENDER_SCRIPT, blendfile]
+            #print 'CMD', cmd
+            subprocess.Popen(cmd)
+        elif APP_SETTINGS.app == 'houdini':
+            print self.geofile, self.uuid
 
 
 # // SETTINGS
+
+BRIDGE_NODE = BridgedNode()
 GEO_EXT = '.obj'
 APP_EXT = '.blend'
 PORT = 6006
@@ -377,8 +485,8 @@ print 'SETTINGS', APP_SETTINGS
      
 # /// CONTROLS
 
+
 def init(discard=False):
-    
     
     selection = pm.selected()
     if len(selection) != 1:
@@ -386,42 +494,41 @@ def init(discard=False):
     else:
         selection = selection[0]
         uuid = cmds.ls(selection.name(), uuid=True)[0]
-        bn = BridgedNode(uuid)
+        #bn = BridgedNode(uuid)
+        #bn = BRIDGE_NODE
+        if BRIDGE_NODE.uuid == None:
+            BRIDGE_NODE.uuid = uuid
+            BRIDGE_NODE.ingest()
         
         if discard:
-            bn.erase_history()
+            BRIDGE_NODE.erase_history()
         
-        bn.ingest()
-        
-        if bn.is_valid():
-            if bn.has_history():
+        if BRIDGE_NODE.is_valid():
+            if BRIDGE_NODE.has_history():
                 print '> file has history. opening source.'
             else:
-                bn.dump_geo()
-                bn.dump_metadata()
+                BRIDGE_NODE.dump_geo()
+                BRIDGE_NODE.dump_metadata()
         else:
-            bn.dump_geo()
-            bn.dump_metadata()
-
+            BRIDGE_NODE.dump_geo()
+            BRIDGE_NODE.dump_metadata()
 
         open_port(PORT)
-        bn.edit_in_app()
+        BRIDGE_NODE.edit_in_app()
 
 
 def update(uuid):
+    print '\n\nUPDATE TRIGGERED> running on', uuid
     
-    
-    
-    
-    
-    print '> running on', uuid
-    bn = BridgedNode(uuid)
-    bn.ingest()
-    if bn.is_valid():
+    if BRIDGE_NODE.is_valid():
         with KeepSelection():
-            print 'GEO', bn.geofile
-            imported_node = load_geofile(bn.geofile)
-            replace_mesh(bn.node, imported_node)
+            pm.select(BRIDGE_NODE.node)
+            print 'GEOMETRY DATA FILE:', BRIDGE_NODE.geofile
+            imported_node = load_geofile(BRIDGE_NODE.geofile)
+                    
+            replace_mesh(BRIDGE_NODE.node, imported_node)
+            print 'restoring materials:'
+            udim_to_sg(BRIDGE_NODE.node, BRIDGE_NODE.udims)
+            
     else:
         print '> UUID invalid.'
-                
